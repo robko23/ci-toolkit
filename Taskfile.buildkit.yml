@@ -1,0 +1,283 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3.45"
+
+vars:
+    BUILDKIT_VERSION: "v0.25.2"
+    ROOTLESSKIT_VERSION: "2.3.5"
+    BIN_DIR: '{{.BIN_DIR| default "/tmp/bin"}}'
+    BUILDKIT_PATH: "{{.BIN_DIR}}/buildkit/{{.BUILDKIT_VERSION}}"
+    ROOTLESSKIT_PATH: "{{.BIN_DIR}}/rootlesskit/{{.ROOTLESSKIT_VERSION}}"
+    BUILDKITD: "{{.BUILDKIT_PATH}}/buildkitd"
+    BUILDCTL: "{{.BUILDKIT_PATH}}/buildctl"
+    ROOTLESSKIT: "{{.ROOTLESSKIT_PATH}}/rootlesskit"
+    PRUNE_KEEP_DAYS: '{{.PRUNE_KEEP_DAYS| default "7"}}'
+    UID: 
+        sh: id -u
+    XDG_RUNTIME_DIR: '{{.XDG_RUNTIME_DIR | default (print "/tmp/xdg-runtime-" (.UID))}}'
+
+run: once
+
+# ll: prefix all tasks because they are low-level
+tasks:
+    # ll:skopeo:
+    #     silent: true
+    #     preconditions:
+    #         -   sh: which docker || which podman
+    #             msg: "to use skopeo, docker or podman must be installed"
+    #     vars:
+    #         HAS_DOCKER:
+    #             sh: "which docker 2>/dev/null > /dev/null && echo true || echo false"
+    #     cmd: >-
+    #         {{if eq .HAS_DOCKER "true"}}
+    #         docker run --rm -v {{.DOCKER_CONFIG}}:/tmp quay.io/skopeo/stable:latest {{.CLI_ARGS}}
+    #         {{else}}
+    #         podman run --rm -it -v {{.DOCKER_CONFIG}}:/tmp docker://quay.io/skopeo/stable:latest {{.CLI_ARGS}}
+    #         {{end}}
+
+    ll:ensure-buildkit:
+        platforms: [linux/amd64]
+        desc: "Download and verify buildkit and rootlesskit binaries"
+        summary: |
+            Downloads buildkit ({{.BUILDKIT_VERSION}}) and rootlesskit ({{.ROOTLESSKIT_VERSION}}) binaries,
+            verifies their integrity using SHA256 checksums, and installs them to versioned directories.
+
+            The task is idempotent - it only downloads if binaries are missing or versions don't match.
+
+            OVERRIDABLE VARIABLES:
+              BIN_DIR (current: {{.BIN_DIR}})
+                Base directory for all downloaded binaries. Binaries are stored in versioned
+                subdirectories: {{.BUILDKIT_PATH}} and {{.ROOTLESSKIT_PATH}}
+
+            BEHAVIOR:
+              - Uses SHA256 checksums for security (downloads fail if checksums don't match)
+              - Downloads only over HTTPS with TLS 1.2+
+              - Skips download if correct versions already exist (status check)
+              - Removes old versions from same BIN_DIR to save space
+
+            SYSTEM REQUIREMENTS:
+              - curl (for downloads)
+              - awk (for version parsing)
+              - Linux amd64 platform
+              - posix-compliant coreutils (for miscellaneous purposes)
+        vars:
+            TEMP_DIR:
+                sh: "mktemp -d"
+            CURL_VERBOSE: "{{if not .CLI_VERBOSE}}-sS{{end}}"
+            SUMFILE: 
+                sh: 'mktemp'
+        silent: true
+        preconditions:
+            -   sh: which curl
+                msg: 'curl is not installed'
+            -   sh: which awk
+                msg: 'awk is not installed'
+        requires:
+            vars: ["BUILDCTL", "BUILDKITD",
+                "ROOTLESSKIT", "BUILDKIT_VERSION",
+                "ROOTLESSKIT_VERSION", "ROOTLESSKIT_PATH", "BUILDKIT_PATH"]
+        status:
+            - test -f {{.BUILDCTL}}
+            - test -f {{.BUILDKITD}}
+            - test -f {{.ROOTLESSKIT}}
+            - test `{{.BUILDCTL}} --version | awk '{print $3;}'` = {{.BUILDKIT_VERSION}}
+            - test `{{.ROOTLESSKIT}} --version | awk '{print $3;}'` = {{.ROOTLESSKIT_VERSION}}
+        cmds:
+            - defer: rm -rf {{.TEMP_DIR}}
+            - defer: rm -rf {{.SUMFILE}}
+
+            - rm -rf {{.BUILDKIT_PATH}} {{.ROOTLESSKIT_PATH}}
+            - mkdir -p {{.BUILDKIT_PATH}}
+            - mkdir -p {{.ROOTLESSKIT_PATH}}
+            - mkdir -p {{.TEMP_DIR}}/unpack
+            # download
+            - echo "Downloading buildkit {{.BUILDKIT_VERSION}}"
+            - curl --proto '=https' --tlsv1.2 --fail {{.CURL_VERBOSE}} -L -o {{.TEMP_DIR}}/buildkit.tgz https://github.com/moby/buildkit/releases/download/{{.BUILDKIT_VERSION}}/buildkit-{{.BUILDKIT_VERSION}}.linux-amd64.tar.gz
+            - defer: rm {{.TEMP_DIR}}/buildkit.tgz
+            - echo "Downloading rootlesskit {{.ROOTLESSKIT_VERSION}}"
+            - "curl --proto '=https' --tlsv1.2 --fail {{.CURL_VERBOSE}} -L -o {{.TEMP_DIR}}/rootlesskit.tgz https://github.com/rootless-containers/rootlesskit/releases/download/v{{.ROOTLESSKIT_VERSION}}/rootlesskit-x86_64.tar.gz"
+            - defer: rm {{.TEMP_DIR}}/rootlesskit.tgz
+            # verify
+            - 'echo "d18b8188b600e201a1b3d08c20e2a1e439cf51d2c2285f132dd9bd51c666f6d6  buildkit.tgz" >> {{.SUMFILE}}'
+            - 'echo "118208e25becd144ee7317c172fc9decce7b16174d5c1bbf80f1d1d0eacc6b5f  rootlesskit.tgz" >> {{.SUMFILE}}'
+            - echo "verifying integrigy of downloaded files against known signature"
+            - 'cd {{.TEMP_DIR}} && sha256sum --strict --check {{.SUMFILE}}'
+            # extract
+            - echo "Extracting buildkit"
+            - tar xzf {{.TEMP_DIR}}/buildkit.tgz -C {{.TEMP_DIR}}/unpack/
+            - cp {{.TEMP_DIR}}/unpack/bin/* {{.BUILDKIT_PATH}}
+            - "echo Extracting rootlesskit"
+            - "tar xzf {{.TEMP_DIR}}/rootlesskit.tgz -C {{.ROOTLESSKIT_PATH}}"
+
+    ll:clean-downloads:
+        desc: "Remove all downloaded buildkit/rootlesskit binaries"
+        summary: |
+            Removes the entire BIN_DIR ({{.BIN_DIR}}), forcing fresh downloads on next build.
+
+            OVERRIDABLE VARIABLES:
+              BIN_DIR (inherited from ll:ensure-buildkit)
+
+            USE CASE:
+              - Free up disk space in CI environments
+              - Force redownload after corrupted downloads
+              - Clean up before archiving CI artifacts
+        silent: true
+        cmd: "rm -rf {{.BIN_DIR}}"
+
+    ll:buildkitd:
+        desc: "Run buildkitd daemon directly"
+        summary: |
+            Low-level task to run buildkitd with custom arguments.
+
+            USAGE:
+              task ll:buildkitd -- --addr unix:///run/buildkit.sock --debug
+
+            OVERRIDABLE VARIABLES:
+              BIN_DIR (see ll:ensure-buildkit summary for details)
+
+            NOTE: Most users should use ll:buildctl-maybe-daemon instead.
+        silent: true
+        vars:
+            ARGS: "{{coalesce .ARGS .CLI_ARGS}}"
+        requires:
+            vars: [ARGS]
+        cmd: "{{.BUILDKITD}} {{.ARGS}}"
+        deps:
+            - task: ll:ensure-buildkit
+
+    ll:buildctl:
+        desc: "Run buildctl client (requires running buildkitd)"
+        summary: |
+            Low-level task to run buildctl with custom arguments. Assumes buildkitd is already running.
+
+            USAGE:
+              task ll:buildctl -- --addr unix:///run/buildkit.sock build --frontend dockerfile.v0 ...
+
+            OVERRIDABLE VARIABLES:
+              BIN_DIR (see ll:ensure-buildkit summary for details)
+
+            NOTE: Most users should use ll:buildctl-maybe-daemon instead.
+        silent: true
+        vars:
+            ARGS: "{{coalesce .ARGS .CLI_ARGS}}"
+        requires:
+            vars: [ARGS]
+        cmd: "{{.BUILDCTL}} {{.ARGS}}"
+        deps:
+            - task: ll:ensure-buildkit
+
+    ll:buildctl-daemonless:
+        desc: "Run buildctl with ephemeral buildkitd (no persistent daemon required)"
+        summary: |
+            Spawns temporary buildkitd daemon, runs buildctl command, then cleans up.
+
+            USAGE:
+              task ll:buildctl-daemonless -- build --frontend dockerfile.v0 --local context=. ...
+
+            OVERRIDABLE VARIABLES:
+              BIN_DIR (see ll:ensure-buildkit summary for details)
+              XDG_RUNTIME_DIR (default: {{.XDG_RUNTIME_DIR}})
+                Runtime directory for buildkitd socket. Uses system XDG_RUNTIME_DIR if set.
+
+            ENVIRONMENT VARIABLES (advanced):
+              BUILDKITD_FLAGS - additional flags passed to buildkitd
+              BUILDCTL_CONNECT_RETRIES_MAX - max connection attempts (default: 20)
+              DEBUG_BUILD - set to 'y', 'yes', 'true', 't', or '1' to enable debug output
+
+            BEHAVIOR:
+              - Automatically runs as root (unix:///run/buildkit/buildkitd.sock) or
+                rootless (unix://$XDG_RUNTIME_DIR/buildkit/buildkitd.sock)
+              - Waits for buildkitd to be ready before running buildctl
+              - Cleans up buildkitd process on exit (success or failure)
+
+            USE CASE:
+              - Local development without persistent daemon
+        silent: true
+        vars:
+            ARGS: "{{coalesce .ARGS .CLI_ARGS}}"
+        requires:
+            vars: [ARGS]
+        deps:
+            - task: ll:ensure-buildkit
+        cmd: "../scripts/buildctl-daemonless.sh {{.ARGS}}"
+        env:
+            BUILDCTL: "{{.BUILDCTL}}"
+            BUILDKITD: "{{.BUILDKITD}}"
+            ROOTLESSKIT: "{{.ROOTLESSKIT}}"
+            XDG_RUNTIME_DIR: "{{.XDG_RUNTIME_DIR}}"
+
+    ll:buildctl-maybe-daemon:
+        desc: "Smart buildctl wrapper (auto-detects daemon vs daemonless mode)"
+        summary: |
+            Intelligent task that chooses between ll:buildctl-daemonless and ll:buildctl based on ADDR variable.
+
+            MODE SELECTION:
+              - If ADDR is NOT set → runs ll:buildctl-daemonless (ephemeral daemon)
+              - If ADDR is set → runs ll:buildctl --addr {ADDR} (connects to existing daemon)
+
+            USAGE:
+              # Daemonless mode (local development, CI without shared daemon)
+              task ll:buildctl-maybe-daemon -- build --frontend dockerfile.v0 ...
+
+              # Daemon mode (CI with shared buildkitd, production)
+              ADDR=unix:///run/buildkit.sock task ll:buildctl-maybe-daemon -- build ...
+              task ll:buildctl-maybe-daemon ADDR=tcp://buildkit-server:1234 -- build ...
+
+            OVERRIDABLE VARIABLES:
+              ADDR (optional)
+                Buildkitd socket/TCP address. If not set, runs in daemonless mode.
+                Examples: unix:///run/buildkit.sock, tcp://localhost:1234
+
+              BIN_DIR, XDG_RUNTIME_DIR (see ll:ensure-buildkit and ll:buildctl-daemonless for details)
+
+            WHY USE THIS:
+              - Single task works for both local dev and CI
+              - CI can set ADDR env var to use shared buildkitd (faster, cached builds)
+              - Local developers don't need to manage buildkitd manually
+        vars: 
+            DAEMONLESS: "{{ empty .ADDR }}"
+        cmds:
+            -   task: '{{ if eq .DAEMONLESS "true" }}ll:buildctl-daemonless{{else}}ll:buildctl{{end}}'
+                vars:
+                    ARGS: '{{ if not (eq .DAEMONLESS "true") }}--addr {{.ADDR}}{{end}} {{coalesce .ARGS .CLI_ARGS}}'
+
+    prune-all:
+        desc: "Delete ALL buildkit caches (use prune-old for retention policy)"
+        summary: |
+            Removes all buildkit build caches regardless of age.
+
+            OVERRIDABLE VARIABLES:
+              ADDR (see ll:buildctl-maybe-daemon summary for details)
+
+            WARNING: This is destructive. Use prune-old for safer cleanup.
+        silent: true
+        cmds:
+            -   task: ll:buildctl-maybe-daemon
+                vars:
+                    ARGS: prune
+
+    prune-old:
+        desc: "Delete buildkit caches older than PRUNE_KEEP_DAYS (current: {{.PRUNE_KEEP_DAYS}} days)"
+        summary: |
+            Removes buildkit caches older than specified retention period.
+
+            OVERRIDABLE VARIABLES:
+              PRUNE_KEEP_DAYS (current: {{.PRUNE_KEEP_DAYS}})
+                Number of days to keep build caches
+
+              ADDR (see ll:buildctl-maybe-daemon summary for details)
+
+            USAGE:
+              task prune-old                    # Keep last {{.PRUNE_KEEP_DAYS}} days
+              task prune-old PRUNE_KEEP_DAYS=14 # Keep last 14 days
+
+            RECOMMENDED FOR:
+              - CI post-build cleanup
+              - Regular maintenance
+        requires:
+            vars:
+                - PRUNE_KEEP_DAYS
+        silent: true
+        cmds:
+            -   task: ll:buildctl-maybe-daemon
+                vars:
+                    ARGS: prune --keep-duration {{mul .PRUNE_KEEP_DAYS 24 60 60}}s

@@ -1,0 +1,4 @@
+name: test
+services:
+    test:
+        image: deploy-gen:${VERSION:?Env VERSION must be set}

@@ -1,0 +1,40 @@
+version: '3.45'
+
+run: once
+
+tasks:
+    build-ok:
+        sources:
+            - ./bin/ok.rs
+        generates:
+            - ./bin/ok
+        cmd: rustc --target x86_64-unknown-linux-musl ./bin/ok.rs -o ./bin/ok
+
+    build-fail:
+        sources:
+            - ./bin/fail.rs
+        generates:
+            - ./bin/fail
+        cmd: rustc --target x86_64-unknown-linux-musl ./bin/fail.rs -o ./bin/fail
+
+    clean:
+        vars:
+            DEPLOY_SCRIPTS:
+                sh: 'cat .deploy-scripts || true'
+        cmds:
+            - rm ./bin/fail ./bin/fail || true
+            -   for:
+                    var: DEPLOY_SCRIPTS
+                    split: "\n"
+                cmd: rm "{{.ITEM}}" || true
+            - echo "" > .deploy-scripts
+
+    build:
+        deps:
+            - task: build-ok
+            - task: build-fail
+
+    test-rollback:
+        deps:
+            - task: build
+        cmd: ./test-rollback.sh
