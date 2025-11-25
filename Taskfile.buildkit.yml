@@ -198,7 +198,7 @@ tasks:
             vars: [ARGS]
         deps:
             - task: ll:ensure-buildkit
-        cmd: "../scripts/buildctl-daemonless.sh {{.ARGS}}"
+        cmd: "./scripts/buildctl-daemonless.sh {{.ARGS}}"
         env:
             BUILDCTL: "{{.BUILDCTL}}"
             BUILDKITD: "{{.BUILDKITD}}"
